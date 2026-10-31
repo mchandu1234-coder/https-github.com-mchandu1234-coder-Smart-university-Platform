@@ -114,7 +114,7 @@ export class DocumentService {
       let layoutChunks: Array<{ text: string; pageNumber: number | null; metadata: any }> = [];
 
       if (detectedType === "pdf") {
-        log("Parsing PDF using Layout-Aware Multimodal Gemini Vision via OpenRouter...");
+        log("Parsing PDF using Layout-Aware Multimodal Gemini Vision...");
         const parsedElements = await parsePdfNativeMultimodal(buffer, fileName || "document.pdf");
         
         layoutChunks = await chunkParsedElements(parsedElements);
@@ -276,6 +276,8 @@ export class DocumentService {
               pageNumber: chunk.pageNumber,
               chunkType: chunk.metadata?.chunkType || "text",
               title: chunk.metadata?.title || null,
+              tableHeaders: chunk.metadata?.tableHeaders || [],
+              visualContext: chunk.metadata?.visualContext || null,
               summary: chunk.metadata?.summary || null,
               collegeId: docRecord?.collegeId || null,
               departmentId: docRecord?.departmentId || null,

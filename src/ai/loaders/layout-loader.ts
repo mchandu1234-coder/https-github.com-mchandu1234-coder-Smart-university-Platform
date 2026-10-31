@@ -49,39 +49,69 @@ const textSplitter = new RecursiveCharacterTextSplitter({
 });
 
 /**
- * Parses a PDF natively using Gemini 2.5 Flash via OpenRouter with automatic fallback.
- * Pass the PDF file buffer directly as a multimodal attachment.
+ * Extracts and validates JSON elements array from multimodal model output.
+ * Strips reasoning preambles, markdown formatting fences, and trailing commentary.
+ */
+function parseAndValidateJsonElements(textOutput: string): ParsedElement[] {
+  if (!textOutput || !textOutput.trim()) return [];
+
+  // Extract content between outermost brackets to safely strip preamble or conversational commentary
+  const firstBracket = textOutput.indexOf("[");
+  const lastBracket = textOutput.lastIndexOf("]");
+
+  let cleanJson = "";
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    cleanJson = textOutput.substring(firstBracket, lastBracket + 1);
+  } else {
+    cleanJson = textOutput
+      .replace(/```json/gi, "")
+      .replace(/```/g, "")
+      .trim();
+  }
+
+  try {
+    const parsed = JSON.parse(cleanJson);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed
+        .filter(
+          (el) =>
+            el &&
+            typeof el === "object" &&
+            typeof el.content === "string" &&
+            el.content.trim().length > 0
+        )
+        .map((el) => ({
+          type: (["text", "table", "chart", "image"].includes(el.type)
+            ? el.type
+            : "text") as ParsedElement["type"],
+          content: el.content.trim(),
+          pageNumber: Number(el.pageNumber) || 1,
+          metadata: {
+            title: el.metadata?.title || undefined,
+            headers: Array.isArray(el.metadata?.headers) ? el.metadata.headers : undefined,
+            visualContext: el.metadata?.visualContext || undefined,
+            summary: el.metadata?.summary || undefined,
+          },
+        }));
+    }
+  } catch (parseErr) {
+    console.warn("[LayoutLoader] JSON.parse error on multimodal model output:", parseErr);
+  }
+
+  return [];
+}
+
+/**
+ * Parses a PDF natively using Gemini 2.5 Flash Vision with automatic resilient fallback.
+ * Extracts paragraphs, structured Markdown tables, chart descriptions, and scanned OCR elements.
  */
 export async function parsePdfNativeMultimodal(
   pdfBuffer: Buffer,
   fileName: string
 ): Promise<ParsedElement[]> {
-  // Fast Path: Extract text with pages locally first.
-  // This executes in < 100ms, does not require OpenRouter file balance ($0.50 minimum),
-  // and preserves accurate per-page text boundaries.
-  try {
-    const { pages, fullText } = await extractTextWithPages(pdfBuffer);
-    if (pages && pages.length > 0 && fullText.trim().length > 50) {
-      console.log(`[LayoutLoader] Fast local PDF extraction successful for "${fileName}": ${pages.length} pages, ${fullText.length} characters.`);
-      return pages.map((p) => ({
-        type: "text" as const,
-        content: p.text,
-        pageNumber: p.pageNumber,
-        metadata: {
-          title: fileName,
-          summary: p.text.slice(0, 200).replace(/\s+/g, " ").trim(),
-        },
-      }));
-    }
-  } catch (localErr) {
-    console.warn(`[LayoutLoader] Local PDF extraction error for ${fileName}, attempting multimodal:`, localErr);
-  }
+  const base64Pdf = pdfBuffer.toString("base64");
 
-  // Fallback Path: For scanned PDFs or image-only documents, use Gemini Multimodal Vision
-  try {
-    const base64Pdf = pdfBuffer.toString("base64");
-    
-    const prompt = `
+  const prompt = `
 You are a layout-aware PDF document parser. Analyze the uploaded PDF document named "${fileName}".
 Understand its layout, separating standard text paragraphs from tables, charts, scanned pages, and images.
 
@@ -110,71 +140,118 @@ Output the result as a single, valid JSON array containing objects matching this
 Return ONLY the raw JSON array. Do not include markdown formatting wraps, fences (like \`\`\`json), or any introductory text.
 `;
 
-    // Try Direct Gemini or OpenRouter
-    const model = process.env.GEMINI_API_KEY
-      ? getGoogleProvider()(ModelConfig.multimodalDirect)
-      : getOpenRouter().chat(ModelConfig.multimodal);
+  // 1. Primary Engine: Direct Google Gemini 2.5 Flash Vision
+  // Provides native PDF understanding, table parsing, chart reading, and OCR with no file-balance limitations.
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      console.log(
+        `[LayoutLoader] Executing Gemini Multimodal Vision for "${fileName}" (${(
+          pdfBuffer.length / 1024
+        ).toFixed(1)} KB)...`
+      );
+      const response = await generateText({
+        model: getGoogleProvider()(ModelConfig.multimodalDirect),
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "file",
+                data: base64Pdf,
+                mediaType: "application/pdf",
+              },
+            ],
+          },
+        ],
+        temperature: 0.1,
+        maxOutputTokens: 16384,
+      });
 
-    const response = await generateText({
-      model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            {
-              type: "file",
-              data: base64Pdf,
-              mediaType: "application/pdf",
-            },
-          ],
-        },
-      ],
-      temperature: 0.1,
-    });
-
-    const textOutput = response.text || "[]";
-    
-    // Clean potential markdown wrappers if the model didn't follow formatting strictly
-    const cleanJson = textOutput
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-
-    const elements: ParsedElement[] = JSON.parse(cleanJson);
-    if (Array.isArray(elements) && elements.length > 0) {
-      return elements;
+      const elements = parseAndValidateJsonElements(response.text);
+      if (elements.length > 0) {
+        console.log(
+          `[LayoutLoader] Direct Gemini Multimodal parsing successful for "${fileName}": extracted ${elements.length} layout elements.`
+        );
+        return elements;
+      }
+      console.warn(
+        `[LayoutLoader] Direct Gemini Multimodal returned no valid elements for "${fileName}". Trying secondary engine...`
+      );
+    } catch (geminiErr: any) {
+      console.warn(
+        `[LayoutLoader] Direct Gemini Multimodal parsing failed for "${fileName}":`,
+        geminiErr?.message || geminiErr
+      );
     }
-    throw new Error("Empty elements returned from multimodal parsing");
-  } catch (error) {
-    console.warn(`[LayoutLoader] Multimodal PDF parsing failed for ${fileName}:`, error instanceof Error ? error.message : error);
-    
-    // Final fallback
-    const { pages, fullText } = await extractTextWithPages(pdfBuffer);
-    if (pages && pages.length > 0) {
-      return pages.map((p) => ({
-        type: "text" as const,
-        content: p.text,
-        pageNumber: p.pageNumber,
-        metadata: {
-          title: fileName,
-          summary: p.text.slice(0, 200),
-        },
-      }));
-    }
-
-    return [
-      {
-        type: "text" as const,
-        content: fullText || "No extractable text found.",
-        pageNumber: 1,
-        metadata: {
-          title: fileName,
-          summary: fullText.slice(0, 200),
-        },
-      },
-    ];
   }
+
+  // 2. Secondary Engine: OpenRouter Multimodal Vision (if Gemini key not present or failed)
+  if (process.env.OPENROUTER_API_KEY) {
+    try {
+      console.log(`[LayoutLoader] Attempting OpenRouter Multimodal Vision for "${fileName}"...`);
+      const response = await generateText({
+        model: getOpenRouter().chat(ModelConfig.multimodal),
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "file",
+                data: base64Pdf,
+                mediaType: "application/pdf",
+              },
+            ],
+          },
+        ],
+        temperature: 0.1,
+        maxOutputTokens: 16384,
+      });
+
+      const elements = parseAndValidateJsonElements(response.text);
+      if (elements.length > 0) {
+        console.log(
+          `[LayoutLoader] OpenRouter Multimodal parsing successful for "${fileName}": extracted ${elements.length} layout elements.`
+        );
+        return elements;
+      }
+    } catch (openRouterErr: any) {
+      console.warn(
+        `[LayoutLoader] OpenRouter Multimodal parsing failed for "${fileName}":`,
+        openRouterErr?.message || openRouterErr
+      );
+    }
+  }
+
+  // 3. Resilient Fallback: Local text extraction (for offline development or API outages)
+  console.warn(
+    `[LayoutLoader] Multimodal engines unavailable or failed for "${fileName}". Falling back to resilient local text extraction.`
+  );
+  const { pages, fullText } = await extractTextWithPages(pdfBuffer);
+  if (pages && pages.length > 0) {
+    return pages.map((p) => ({
+      type: "text" as const,
+      content: p.text,
+      pageNumber: p.pageNumber,
+      metadata: {
+        title: fileName,
+        summary: p.text.slice(0, 200).replace(/\s+/g, " ").trim(),
+      },
+    }));
+  }
+
+  return [
+    {
+      type: "text" as const,
+      content: fullText || "No extractable text found.",
+      pageNumber: 1,
+      metadata: {
+        title: fileName,
+        summary: (fullText || "").slice(0, 200),
+      },
+    },
+  ];
 }
 
 /**
@@ -204,14 +281,19 @@ export async function chunkParsedElements(
       // Split large text paragraphs semantically
       const splitTexts = await textSplitter.splitText(element.content);
       splitTexts.forEach((text) => {
-        chunks.push({
-          text,
-          pageNumber: element.pageNumber,
-          metadata: {
-            chunkType: "text",
-            title: element.metadata?.title || null,
-          },
-        });
+        if (text && text.trim().length > 0) {
+          chunks.push({
+            text: text.trim(),
+            pageNumber: element.pageNumber,
+            metadata: {
+              chunkType: "text",
+              title: element.metadata?.title || null,
+              tableHeaders: [],
+              visualContext: null,
+              summary: element.metadata?.summary || null,
+            },
+          });
+        }
       });
     }
   }

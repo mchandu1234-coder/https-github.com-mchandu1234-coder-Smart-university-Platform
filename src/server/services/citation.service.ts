@@ -35,12 +35,22 @@ export class CitationService {
       const sectionInfo = chunk.sectionHeader || chunk.metadata?.title
         ? ` | Section: ${chunk.sectionHeader || chunk.metadata?.title}`
         : "";
+      const chunkType = chunk.metadata?.chunkType;
+      const typeInfo = chunkType && chunkType !== "text"
+        ? ` | Element Type: ${chunkType.toUpperCase()}`
+        : "";
+      const visualInfo = chunk.metadata?.visualContext
+        ? `\nVisual Context: ${chunk.metadata.visualContext}`
+        : "";
+      const summaryInfo = chunk.metadata?.summary
+        ? `\nElement Summary: ${chunk.metadata.summary}`
+        : "";
       const confidenceInfo = chunk.metadata?.fusionScore
         ? ` | Confidence: ${(chunk.metadata.fusionScore * 100).toFixed(1)}%`
         : "";
 
       return `[Citation ID: ${index + 1}]
-Source: ${chunk.documentName || "Unknown Document"} (v${docVer}, Chunk: ${chunk.chunkIndex})${pageInfo}${sectionInfo}${confidenceInfo}
+Source: ${chunk.documentName || "Unknown Document"} (v${docVer}, Chunk: ${chunk.chunkIndex})${pageInfo}${sectionInfo}${typeInfo}${confidenceInfo}${visualInfo}${summaryInfo}
 Document ID: ${chunk.documentId || "N/A"} | Chunk Hash: ${chunk.chunkHash || chunk.chunkId}
 Content:
 ${chunk.chunkText}`;
